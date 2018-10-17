@@ -9,6 +9,7 @@ import skimage.transform
 import argparse
 from scipy.misc import imread, imresize
 from PIL import Image
+import glob
 from netdissect.broden import BrodenDataset
 import netdissect.dissection as dissection
 
@@ -189,6 +190,16 @@ def visualize_att(image_path, seq, alphas, rev_word_map, smooth=True):
         plt.axis('off')
     plt.show()
 
+def gather_word_data(encoder, decoder, img_list, word_map, beam_size):
+    sentences = []
+    rev_word_map = {v: k for k, v in word_map.items()}
+    for img in img_list:
+        seq, alphas = caption_image_beam_search(encoder, decoder, img, word_map, beam_size)
+        # alphas = torch.FloatTensor(alphas)
+        # Visualize caption and attention of best sequence
+        sentences.append([rev_word_map[i] for i in seq])
+    return sentences
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Show, Attend, and Tell - Tutorial - Generate Caption')
@@ -215,25 +226,38 @@ if __name__ == '__main__':
     encoder = checkpoint['encoder']
 
 
-    print(encoder)
+    #print(encoder)
 
     encoder.eval()
     encoder = encoder.to(device)
 
-    dissection.replace_layers(encoder, [('resnet.7.2', 'output_layer'), ])
-    encoder.replacement['output_layer'] = torch.zeros(2048).to(device).type(torch.cuda.FloatTensor)
-
-    #end richard code
+    iter_over_list = True
 
     # Load word map (word2ix)
     print("!!!")
+
     with open(args.word_map, 'r') as j:
         word_map = json.load(j)
+    print(len(word_map))
     rev_word_map = {v: k for k, v in word_map.items()}  # ix2word
 
-    # Encode, decode with attention and beam search
-    seq, alphas = caption_image_beam_search(encoder, decoder, args.img, word_map, args.beam_size)
-    alphas = torch.FloatTensor(alphas)
 
-    # Visualize caption and attention of best sequence
-    visualize_att(args.img, seq, alphas, rev_word_map, args.smooth)
+    # Choose whether to iterate over all the captions
+    if iter_over_list:
+        dissection.ablate_layers(encoder, [('resnet.7.2', 'output_layer'), ])
+        ablation = torch.ones(2048)
+        ablation[100] = 1
+        #print(ablation)
+        encoder.ablation['output_layer'] = ablation.to(device).type(torch.cuda.FloatTensor)
+
+        img_list = glob.glob('C:/Users/Richard/Documents/MIT stuff/2018 Fall/research/a-PyTorch-Tutorial-to-Image-Captioning/img/flickr8k_dataset/*.jpg')
+        word_mat = gather_word_data(encoder, decoder, img_list[:10], word_map, args.beam_size)
+        print(word_mat)
+
+    else:
+        # Encode, decode with attention and beam search
+
+        seq, alphas = caption_image_beam_search(encoder, decoder, args.img, word_map, args.beam_size)
+        alphas = torch.FloatTensor(alphas)
+
+        visualize_att(args.img, seq, alphas, rev_word_map, args.smooth)
