@@ -10,7 +10,9 @@ import argparse
 from scipy.misc import imread, imresize
 from PIL import Image
 import glob
+import time
 from netdissect.broden import BrodenDataset
+import pickle
 import netdissect.dissection as dissection
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -191,13 +193,19 @@ def visualize_att(image_path, seq, alphas, rev_word_map, smooth=True):
     plt.show()
 
 def gather_word_data(encoder, decoder, img_list, word_map, beam_size):
+    if not isinstance(img_list,list):
+        img_list = [img_list]
     sentences = []
     rev_word_map = {v: k for k, v in word_map.items()}
     for img in img_list:
-        seq, alphas = caption_image_beam_search(encoder, decoder, img, word_map, beam_size)
+        try:
+            seq, alphas = caption_image_beam_search(encoder, decoder, img, word_map, beam_size)
         # alphas = torch.FloatTensor(alphas)
         # Visualize caption and attention of best sequence
-        sentences.append([rev_word_map[i] for i in seq])
+            sentences.append([rev_word_map[i] for i in seq])
+        except ValueError:
+            print("no caption")
+            sentences.append([])
     return sentences
 
 
@@ -238,21 +246,209 @@ if __name__ == '__main__':
 
     with open(args.word_map, 'r') as j:
         word_map = json.load(j)
-    print(len(word_map))
+    #print(len(word_map))
     rev_word_map = {v: k for k, v in word_map.items()}  # ix2word
 
 
     # Choose whether to iterate over all the captions
     if iter_over_list:
-        dissection.ablate_layers(encoder, [('resnet.7.2', 'output_layer'), ])
-        ablation = torch.ones(2048)
-        ablation[100] = 1
-        #print(ablation)
-        encoder.ablation['output_layer'] = ablation.to(device).type(torch.cuda.FloatTensor)
-
         img_list = glob.glob('C:/Users/Richard/Documents/MIT stuff/2018 Fall/research/a-PyTorch-Tutorial-to-Image-Captioning/img/flickr8k_dataset/*.jpg')
-        word_mat = gather_word_data(encoder, decoder, img_list[:10], word_map, args.beam_size)
-        print(word_mat)
+        one_img = img_list[201]
+
+        #specify method by which we search through captions
+        method = "insert_topic"
+        if method == "insert_topic":
+            word_to_tensor_pkl = "word_to_tensors_4000.p"
+            nd = pickle.load(open(word_to_tensor_pkl, "rb"))
+
+            x = sorted(nd.keys(), key=lambda x: len(nd[x][0]), reverse=True)
+            # Print out top 10 words.
+            for i in range(30): print(x[i], len(nd[x[i]][0]))
+
+
+            target_word = "man"
+            avg_channels = nd[target_word][1]
+            avg_all = nd["<start>"][1]
+
+            images_not_containing_target = [im for im in nd["<start>"][0] if im not in nd[target_word][0]]
+            #print(images_not_containing_target[0])
+
+            #print(avg_channels)
+            #num_avg_channels = [b.item() for b in [c for c in avg_channels]]
+            #print(num_avg_channels)
+
+            #avg_tgt_word_output = [sum(x)/len(x) for x in zip(*[np.array(c) for c in avg_channels])]
+            avg_tgt_word_output = np.mean([np.array(c) for c in avg_channels],axis=0)
+            avg_all_output = np.mean([np.array(c) for c in avg_all],axis=0)
+            #print(len(avg_tgt_word_output))
+
+            #Set to 0 to generate original image
+            num_channels = 400
+            top_n_channels = sorted(range(2048),key = lambda x: abs(avg_tgt_word_output[x]-avg_all_output[x]),reverse=True)[:num_channels]
+            #print(top_n_channels)
+
+            num_imgs_to_test = 100
+            original_and_modified = []
+            for i in range(num_imgs_to_test):
+
+                current_img = images_not_containing_target[i]
+                word_mat = gather_word_data(encoder, decoder, current_img, word_map, args.beam_size)
+                original_and_modified.append(word_mat)
+                #NETDISSECT STARTS HERE
+            ne = encoder
+            dissection.ablate_layers(encoder, [('resnet.7.2', 'output_layer')])
+            ablation = torch.ones(2048)
+            for channel in top_n_channels:
+                ablation[channel] = 0
+            encoder.ablation['output_layer'] = ablation.to(device).type(torch.cuda.FloatTensor)
+
+            dissection.ablate_layers(encoder, [('resnet.7.2', 'output_layer')], adding=True)
+            replacement = torch.zeros(2048)
+            for channel in top_n_channels:
+                replacement[channel] = avg_tgt_word_output[channel].item()
+            encoder.ablation['output_layer'] = replacement.to(device).type(torch.cuda.FloatTensor)
+
+            # dissection.replace_layers(encoder, [('resnet.7.2', 'output_layer')])
+            # rep = torch.tensor(avg_tgt_word_output)
+            # encoder.replacement['output_layer'] = rep.to(device).type(torch.cuda.FloatTensor)
+            for i in range(num_imgs_to_test):
+                current_img = images_not_containing_target[i]
+                viz = False
+                if viz:
+
+                    seq, alphas = caption_image_beam_search(encoder, decoder, current_img, word_map, args.beam_size)
+                    alphas = torch.FloatTensor(alphas)
+                    print("==ORIGINAL==")
+                    print(original_and_modified[i])
+                    visualize_att(current_img, seq, alphas, rev_word_map, args.smooth)
+                word_mat = gather_word_data(encoder, decoder, current_img, word_map, args.beam_size)
+                original_and_modified[i].append(word_mat[0])
+            # for img in original_and_modified:
+            #     print(img[0])
+            #     print(img[1])
+            #     print("==")
+            # for x in original_and_modified: print(x[1])
+
+            num_inserted = sum([1 for x in original_and_modified if target_word in x[1]])
+            print("target word: ",target_word, "num channels: ",num_channels)
+            print("num inserted: ",num_inserted,"num_tested: ",num_imgs_to_test,"ratio: ",num_inserted/num_imgs_to_test)
+
+
+        elif method == "search_for_channel_topics":
+            word_to_tensor_pkl = "word_to_tensors_100.p"
+
+            #Dictionary mapping words to [[img],[avg_channels]] for each img that generates the word
+            nd = pickle.load(open(word_to_tensor_pkl, "rb"))
+            x = sorted(nd.keys(),key = lambda x: len(nd[x][0]),reverse=True)
+
+            #Print out top 10 words.
+            for i in range(10):
+                print(x[i],len(nd[x[i]][0]))
+            bestword = nd[x[0]][1]
+            bestword2 = nd[x[9]][1]
+            aa = []
+
+            bb = []
+            for i in range(len(bestword[0])):
+                #print(i,len(bestword[0]))
+                aa.append(sum([wd[i] for wd in bestword[:100]])/len(bestword))
+                bb.append(sum([wd[i] for wd in bestword2[:100]])/len(bestword2))
+            #print(aa)
+
+            s = [nm.item() for nm in aa]
+            q = [nm.item() for nm in bb]
+            #plt.plot(s)
+            #plt.plot(q)
+            plt.plot([s[i]-q[i] for i in range(len(s))])
+            #plt.show()
+
+        elif method=="search_for_channel_topics":
+            num_imgs = 100
+            truncated_img_list = img_list[:num_imgs]
+            dissection.retain_layers(encoder, [('resnet.7.2', 'output_layer')])
+            word_to_tensors = {} # word -> [list of images, list of avg_channels]
+            # Note that <start> and <end> will have all imgs and all avg channels
+
+
+            #timing
+            t = time.time()
+
+            for img in truncated_img_list:
+                #dissection.retain_layers(encoder, [('resnet.7.2', 'output_layer')])
+                word_mat = gather_word_data(encoder, decoder, img, word_map, args.beam_size)
+                encoder_output = encoder.retained['output_layer'][0]
+                #for word in word_mat:
+                #    print(word)
+                #print(encoder_output,encoder_output.size())
+                avg_channels =encoder_output.mean(dim = 1).mean(dim=1)
+                #print(avg_channels,avg_channels.size())
+                for word in set(word_mat[0]):
+                    if word not in word_to_tensors:
+                        word_to_tensors[word] = [[img],[avg_channels]]
+                    else:
+                        word_to_tensors[word][0].append(img)
+                        word_to_tensors[word][1].append(avg_channels)
+            word_freqs = sorted([[x,len(word_to_tensors[x][0])] for x in word_to_tensors],key=lambda x: x[1],reverse=True)
+            toc = time.time()-t
+            print("images: ",num_imgs," time: ",toc, " time per img: ",toc/num_imgs)
+            #for word in word_freqs:
+            #    print(word)
+            print("pickling")
+            pickle.dump(word_to_tensors,open("word_to_tensors_100.p","wb"))
+            #print("unpickling")
+            #nd = pickle.load(open("word_to_tensors.p","rb"))
+            #print(nd)
+
+        elif method=="ablate_one_channel":
+            channel = 106 #23 = bathrooms
+            dissection.retain_layers(encoder, [('resnet.7.2', 'output_layer')])
+            dissection.ablate_layers(encoder, [('resnet.7.2', 'output_layer')])
+            #dissection.replace_layers(encoder, [('resnet.7.2', 'output_layer')])
+            #replacement = torch.zeros(2048)
+            #replacement[channel] = 100
+            ablation = torch.ones(2048)
+            ablation[channel] = 0
+            #print(ablation)
+            encoder.ablation['output_layer'] = ablation.to(device).type(torch.cuda.FloatTensor)
+
+            dissection.ablate_layers(encoder, [('resnet.7.2', 'output_layer')], adding=True)
+            addition = torch.zeros(2048)
+            addition[channel] = 50
+            encoder.ablation['output_layer'] = addition.to(device).type(torch.cuda.FloatTensor)
+
+            viz = True
+            if viz:
+                seq, alphas = caption_image_beam_search(encoder, decoder, one_img, word_map, args.beam_size)
+                alphas = torch.FloatTensor(alphas)
+
+                visualize_att(one_img, seq, alphas, rev_word_map, args.smooth)
+            word_mat = gather_word_data(encoder, decoder, one_img, word_map, args.beam_size)
+            encoder_output = encoder.retained['output_layer'][0]
+            print(encoder_output[channel])
+
+
+            for word in word_mat:
+                print(word)
+
+
+
+        elif method == "observe_single_channel":
+            dissection.replace_layers(encoder, [('resnet.7.2', 'output_layer'), ])
+            replacement = torch.zeros(2048)
+            oneval = [0,1,10,100,1000,10000]
+            for i in range(len(oneval)):
+                replacement[1002] = oneval[i]
+                encoder.replacement['output_layer'] = replacement.to(device).type(torch.cuda.FloatTensor)
+                word_mat = gather_word_data(encoder, decoder, img_list[0], word_map, args.beam_size)
+                #seq, alphas = caption_image_beam_search(encoder, decoder, args.img, word_map, args.beam_size)
+                #alphas = torch.FloatTensor(alphas)
+                #visualize_att(args.img, seq, alphas, rev_word_map, args.smooth)
+                for word in word_mat:
+                    st = ""
+                    for w in word:
+                        st +=w + " "
+
+                    print(st)
 
     else:
         # Encode, decode with attention and beam search
