@@ -15,6 +15,8 @@ from netdissect.broden import BrodenDataset
 import pickle
 import netdissect.dissection as dissection
 import os
+from random import shuffle
+
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -96,8 +98,8 @@ def caption_image_beam_search(encoder, decoder, image_path, word_map, beam_size=
         alpha = alpha.view(-1, enc_image_size, enc_image_size)  # (s, enc_image_size, enc_image_size)
 
         gate = decoder.sigmoid(decoder.f_beta(h))  # gating scalar, (s, encoder_dim)
-        awe = gate * awe
 
+        awe = gate * awe
         h, c = decoder.decode_step(torch.cat([embeddings, awe], dim=1), (h, c))  # (s, decoder_dim)
 
         scores = decoder.fc(h)  # (s, vocab_size)
@@ -156,6 +158,154 @@ def caption_image_beam_search(encoder, decoder, image_path, word_map, beam_size=
 
     return seq, alphas
 
+def caption_image_beam_search_awes(encoder, decoder, image_path, word_map, beam_size=3):
+    """
+    Reads an image and captions it with beam search.
+
+    :param encoder: encoder model
+    :param decoder: decoder model
+    :param image_path: path to image
+    :param word_map: word map
+    :param beam_size: number of sequences to consider at each decode-step
+    :return: caption, weights for visualization
+    """
+
+    k = beam_size
+    vocab_size = len(word_map)
+
+    # Read image and process
+    img = imread(image_path)
+    if len(img.shape) == 2:
+        img = img[:, :, np.newaxis]
+        img = np.concatenate([img, img, img], axis=2)
+    img = imresize(img, (256, 256))
+    img = img.transpose(2, 0, 1)
+    img = img / 255.
+    img = torch.FloatTensor(img).to(device)
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+    transform = transforms.Compose([normalize])
+    image = transform(img)  # (3, 256, 256)
+
+    # Encode
+    image = image.unsqueeze(0)  # (1, 3, 256, 256)
+
+
+
+    encoder_out = encoder(image)  # (1, enc_image_size, enc_image_size, encoder_dim)
+    enc_image_size = encoder_out.size(1)
+    encoder_dim = encoder_out.size(3)
+
+    # Flatten encoding
+    encoder_out = encoder_out.view(1, -1, encoder_dim)  # (1, num_pixels, encoder_dim)
+    num_pixels = encoder_out.size(1)
+
+    # We'll treat the problem as having a batch size of k
+    encoder_out = encoder_out.expand(k, num_pixels, encoder_dim)  # (k, num_pixels, encoder_dim)
+
+    # Tensor to store top k previous words at each step; now they're just <start>
+    k_prev_words = torch.LongTensor([[word_map['<start>']]] * k).to(device)  # (k, 1)
+
+    # Tensor to store top k sequences; now they're just <start>
+    seqs = k_prev_words  # (k, 1)
+
+    # Tensor to store top k sequences' scores; now they're just 0
+    top_k_scores = torch.zeros(k, 1).to(device)  # (k, 1)
+
+    # Tensor to store top k sequences' alphas; now they're just 1s
+    seqs_alpha = torch.ones(k, 1, enc_image_size, enc_image_size).to(device)  # (k, 1, enc_image_size, enc_image_size)
+
+    #LAST LAYER HAS 2048 CHANNELS
+    seqs_awe = torch.ones(k, 1, 2048).to(device)
+    # Lists to store completed sequences, their alphas and scores
+    complete_seqs = list()
+    complete_seqs_alpha = list()
+    complete_seqs_awe = list()
+    complete_seqs_scores = list()
+
+    # Start decoding
+    step = 1
+    h, c = decoder.init_hidden_state(encoder_out)
+
+    # s is a number less than or equal to k, because sequences are removed from this process once they hit <end>
+    while True:
+
+        embeddings = decoder.embedding(k_prev_words).squeeze(1)  # ( s, embed_dim)
+
+        awe, alpha = decoder.attention(encoder_out, h)  # (s, encoder_dim), (s, num_pixels)
+
+        alpha = alpha.view(-1, enc_image_size, enc_image_size)  # (s, enc_image_size, enc_image_size)
+
+        gate = decoder.sigmoid(decoder.f_beta(h))  # gating scalar, (s, encoder_dim)
+
+        awe = gate * awe
+        # print(awe[0])
+        # print(np.linalg.norm(awe[0].detach()))
+        # print(np.linalg.norm(awe[0].detach(),1))
+        h, c = decoder.decode_step(torch.cat([embeddings, awe], dim=1), (h, c))  # (s, decoder_dim)
+
+        scores = decoder.fc(h)  # (s, vocab_size)
+        scores = F.log_softmax(scores, dim=1)
+
+        # Add
+        scores = top_k_scores.expand_as(scores) + scores  # (s, vocab_size)
+
+        # For the first step, all k points will have the same scores (since same k previous words, h, c)
+        if step == 1:
+            top_k_scores, top_k_words = scores[0].topk(k, 0, True, True)  # (s)
+        else:
+            # Unroll and find top scores, and their unrolled indices
+            top_k_scores, top_k_words = scores.view(-1).topk(k, 0, True, True)  # (s)
+
+        # Convert unrolled indices to actual indices of scores
+        prev_word_inds = top_k_words / vocab_size  # (s)
+        next_word_inds = top_k_words % vocab_size  # (s)
+
+        # Add new words to sequences, alphas
+        seqs = torch.cat([seqs[prev_word_inds], next_word_inds.unsqueeze(1)], dim=1)  # (s, step+1)
+        seqs_alpha = torch.cat([seqs_alpha[prev_word_inds], alpha[prev_word_inds].unsqueeze(1)],
+                               dim=1)  # (s, step+1, enc_image_size, enc_image_size)
+
+        seqs_awe = torch.cat([seqs_awe[prev_word_inds], awe[prev_word_inds].unsqueeze(1)],dim=1)  # (s, step+1, enc_image_size, enc_image_size)
+        # Which sequences are incomplete (didn't reach <end>)?
+        incomplete_inds = [ind for ind, next_word in enumerate(next_word_inds) if
+                           next_word != word_map['<end>']]
+        complete_inds = list(set(range(len(next_word_inds))) - set(incomplete_inds))
+
+        # Set aside complete sequences
+        if len(complete_inds) > 0:
+            complete_seqs.extend(seqs[complete_inds].tolist())
+            complete_seqs_awe.extend(seqs_awe[complete_inds].tolist())
+            complete_seqs_alpha.extend(seqs_alpha[complete_inds].tolist())
+            complete_seqs_scores.extend(top_k_scores[complete_inds])
+        k -= len(complete_inds)  # reduce beam length accordingly
+
+        # Proceed with incomplete sequences
+        if k == 0:
+            break
+        seqs = seqs[incomplete_inds]
+        seqs_alpha = seqs_alpha[incomplete_inds]
+        h = h[prev_word_inds[incomplete_inds]]
+        c = c[prev_word_inds[incomplete_inds]]
+        encoder_out = encoder_out[prev_word_inds[incomplete_inds]]
+        top_k_scores = top_k_scores[incomplete_inds].unsqueeze(1)
+        k_prev_words = next_word_inds[incomplete_inds].unsqueeze(1)
+
+        # Break if things have been going on too long
+        if step > 50:
+            break
+        step += 1
+
+    i = complete_seqs_scores.index(max(complete_seqs_scores))
+    seq = complete_seqs[i]
+    alphas = complete_seqs_alpha[i]
+    awes = complete_seqs_awe[i]
+    normalize = False
+    if normalize:
+        normalized_awes = [[x*len(awe) / sum(awe) for x in awe] for awe in awes]
+    else:
+        normalized_awes = awes
+    return seq, alphas, normalized_awes
 
 def visualize_att(image_path, seq, alphas, rev_word_map, smooth=True):
     """
@@ -217,20 +367,22 @@ def observe_single_channel(encoder,decoder,channel_num):
             print(st)
 
 
-def gather_word_data(encoder, decoder, img_list, word_map, beam_size):
+def gather_word_data(encoder, decoder, img_list, word_map, beam_size,include_awes=False):
     if not isinstance(img_list,list):
         img_list = [img_list]
     sentences = []
     rev_word_map = {v: k for k, v in word_map.items()}
     for img in img_list:
         try:
-            seq, alphas = caption_image_beam_search(encoder, decoder, img, word_map, beam_size)
+            seq, alphas, awes = caption_image_beam_search_awes(encoder, decoder, img, word_map, beam_size)
         # alphas = torch.FloatTensor(alphas)
         # Visualize caption and attention of best sequence
             sentences.append([rev_word_map[i] for i in seq])
         except ValueError:
             print("no caption")
             sentences.append([])
+    if include_awes:
+        return sentences,awes
     return sentences
 
 def ablate_one_channel(encoder,decoder,img_to_test,channel_num):
@@ -264,7 +416,7 @@ def ablate_one_channel(encoder,decoder,img_to_test,channel_num):
     for word in word_mat:
         print(word)
 
-def save_channels_per_word(encoder,decoder,image_list,num_images = None,pkl_location = "word_to_tensors_default.p"):
+def save_channels_per_word(encoder,decoder,image_list,num_images = None,scale_by_attention=False,pkl_location = "word_to_tensors_default.p"):
     if num_images is None:
         num_images = len(image_list)
     truncated_img_list = image_list[:num_images]
@@ -274,43 +426,72 @@ def save_channels_per_word(encoder,decoder,image_list,num_images = None,pkl_loca
 
     # timing
     t = time.time()
-
-    for img in truncated_img_list:
+    print("adding image captions to dictionary")
+    #for img in truncated_img_list:
+    for i in range(len(truncated_img_list)):
+        if True:#i%100==0:
+            print("image ",i,"/",len(truncated_img_list))
+        img = truncated_img_list[i]
         # dissection.retain_layers(encoder, [('resnet.7.2', 'output_layer')])
-        word_mat = gather_word_data(encoder, decoder, img, word_map, args.beam_size)
+        word_mat, awes = gather_word_data(encoder, decoder, img, word_map, args.beam_size, include_awes=True)
+        if not scale_by_attention:
+            awes = np.ones_like(awes)
         encoder_output = encoder.retained['output_layer'][0]
         # for word in word_mat:
         #    print(word)
         # print(encoder_output,encoder_output.size())
-        avg_channels = encoder_output.mean(dim=1).mean(dim=1)
-        # print(avg_channels,avg_channels.size())
-        for word in set(word_mat[0]):
+        avg_channels = encoder_output
+        #print(avg_channels.type())
+        #print(avg_channels.size())
+        word_mat = word_mat[0]
+
+
+        wds_to_sum_awes = {}
+        for wd_index in range(len(word_mat)):
+            word = word_mat[wd_index]
+            awe = awes[wd_index]
+            if word not in wds_to_sum_awes:
+                wds_to_sum_awes[word] = awe
+            else:
+                wds_to_sum_awes[word] = np.add(awe,wds_to_sum_awes[word])
+
+        for word in wds_to_sum_awes:
+            word_awe = wds_to_sum_awes[word]
+            #avg_channels = np.multiply(np.array(encoder_output).transpose(), word_awe).transpose()
+            #avg_channels = np.array(encoder_output)
+
+            #avg_channels = (encoder_output).type(torch.cuda.FloatTensor)
+            #avg_channels = torch.ones_like(encoder_output).type(torch.cuda.FloatTensor)
             if word not in word_to_tensors:
-                word_to_tensors[word] = [[img], [avg_channels]]
+                word_to_tensors[word] = [[img], [avg_channels],[word_awe]]
             else:
                 word_to_tensors[word][0].append(img)
                 word_to_tensors[word][1].append(avg_channels)
-    word_freqs = sorted([[x, len(word_to_tensors[x][0])] for x in word_to_tensors], key=lambda x: x[1], reverse=True)
+                word_to_tensors[word][2].append(word_awe)
+    #word_freqs = sorted([[x, len(word_to_tensors[x][0])] for x in word_to_tensors], key=lambda x: x[1], reverse=True)
     toc = time.time() - t
     print("images: ", num_images, " time: ", toc, " time per img: ", toc / num_images)
     # for word in word_freqs:
     #    print(word)
-    print("pickling")
 
+    # print(encoder_output[0])
+    # for word in word_to_tensors:
+    #     print(word,np.shape(word_to_tensors[word][2]))
 
-    #Current file directory:
-    pkled_directory = os.path.dirname(__file__) + "/word_to_tensors_dicts/"
-
-    pickle.dump(word_to_tensors, open(pkled_directory + pkl_location, "wb"))
+    #directory to pickle to:
+    pkled_directory = os.path.dirname(os.path.abspath(__file__)) + "/word_to_tensors_dicts/" + pkl_location
+    print("pickling to: ", pkled_directory)
+    pickle.dump(word_to_tensors, open(pkled_directory , "wb"))
     # print("unpickling")
     # nd = pickle.load(open("word_to_tensors.p","rb"))
     # print(nd)
 
 def search_for_channel_topics(pkl_location = "word_to_tensors_default.p"):
-    # Dictionary mapping words to [[img],[avg_channels]] for each img that generates the word4
-    pkled_directory = os.path.dirname(__file__) + "/word_to_tensors_dicts/"
+    # Dictionary mapping words to [[img],[avg_channels]] for each img that generates the word
+    pkled_directory = os.path.dirname(__file__) + "/word_to_tensors_dicts/" + pkl_location
+    print("loading pickled dict from: ", pkled_directory)
 
-    nd = pickle.load(open(pkled_directory + pkl_location, "rb"))
+    nd = pickle.load(open(pkled_directory, "rb"))
     x = sorted(nd.keys(), key=lambda x: len(nd[x][0]), reverse=True)
 
     # Print out top 10 words.
@@ -334,30 +515,64 @@ def search_for_channel_topics(pkl_location = "word_to_tensors_default.p"):
     plt.plot([s[i] - q[i] for i in range(len(s))])
     plt.show()
 
-def insert_topic_into_caption(encoder,decoder,target_word,word_to_tensor_pkl="word_to_tensors_4000.p",num_imgs_to_test=20,viz=False):
-    nd = pickle.load(open(word_to_tensor_pkl, "rb"))
+def insert_topic_into_caption(encoder,decoder,target_word,word_to_tensor_pkl="word_to_tensors_default.p",num_imgs_to_test=None,viz=False,randomize=False):
+    pkled_directory = os.path.dirname(os.path.abspath(__file__)) + "/word_to_tensors_dicts/" + word_to_tensor_pkl
+    nd = pickle.load(open(pkled_directory, "rb"))
 
     sorted_word_frequencies = sorted(nd.keys(), key=lambda x: len(nd[x][0]), reverse=True)
     # Print out top 10 words.
     for i in range(30): print(sorted_word_frequencies[i], len(nd[sorted_word_frequencies[i]][0]))
 
+
+    # avg_channels = np.multiply(np.array(encoder_output).transpose(), word_awe).transpose()
     avg_channels = nd[target_word][1]
+    avg_awe_word = nd[target_word][2]
+    t = time.time()
+    for i in range(len(avg_channels)):
+        avg_channels[i] = np.multiply(np.array(avg_channels[i]).transpose(), avg_awe_word[i]).transpose()
+    toc = time.time() - t
+
+    #print("time: ",toc)
+
+    #print(avg_channels[0],len(avg_channels))
+    #avgs = avg_channels[0].mean(dim=1).mean(dim=1)
+    #print(avgs.size())
     avg_all = nd["<start>"][1]
 
     images_not_containing_target = [im for im in nd["<start>"][0] if im not in nd[target_word][0]]
-    # print(images_not_containing_target[0])
+    if randomize:
+        shuffle(images_not_containing_target)
 
+    # print(images_not_containing_target[0])
     avg_tgt_word_output = np.mean([np.array(c) for c in avg_channels], axis=0)
     avg_all_output = np.mean([np.array(c) for c in avg_all], axis=0)
-    # print(len(avg_tgt_word_output))
+    #print(np.linalg.norm(avg_tgt_word_output[0] - avg_all_output[0]))
 
     # Number of channels to change. Set to 0 to generate original image
-    num_channels = 400
-    top_n_channels = sorted(range(len(avg_all_output)), key=lambda x: abs(avg_tgt_word_output[x] - avg_all_output[x]), reverse=True)[:num_channels]
+    # ======================
+
+    num_channels = 40
+
+    #channels_by_significance = sorted(range(len(avg_all_output)), key=lambda x: np.linalg.norm(avg_tgt_word_output[x] - avg_all_output[x],1), reverse=True)
+    channels_by_significance = sorted(range(len(avg_all_output)), key=lambda x: np.sum(avg_tgt_word_output[x] - avg_all_output[x]), reverse=True)
+    top_n_channels = channels_by_significance[:num_channels] + channels_by_significance[-num_channels:]
+
+    plt.plot([np.sum(avg_tgt_word_output[x] - avg_all_output[x]) for x in channels_by_significance][:100])
+    plt.xlabel("Channel (sorted by decreasing relative intensity)")
+    plt.ylabel("Relative intensity")
+    plt.title("Intensity of channels (weighted by attention) for target word relative to baseline")
+    plt.show()
+    # plt.plot([np.sum(avg_tgt_word_output[x] - avg_all_output[x]) for x in channels_by_significance][-200:])
+    # plt.show()
+
     # print(top_n_channels)
 
     original_and_modified = []
-    for i in range(num_imgs_to_test):
+
+    if num_imgs_to_test is None:
+        num_imgs_to_test = len(images_not_containing_target)
+    final_num_images_to_test = min(num_imgs_to_test,len(images_not_containing_target))
+    for i in range(final_num_images_to_test):
         current_img = images_not_containing_target[i]
         word_mat = gather_word_data(encoder, decoder, current_img, word_map, args.beam_size)
         original_and_modified.append(word_mat)
@@ -365,38 +580,55 @@ def insert_topic_into_caption(encoder,decoder,target_word,word_to_tensor_pkl="wo
 
     # NETDISSECT STARTS HERE
     dissection.ablate_layers(encoder, [('resnet.7.2', 'output_layer')])
-    ablation = torch.ones(2048)
+    ablation = torch.ones(1,2048,8,8)
     for channel in top_n_channels:
-        ablation[channel] = 0
+        ablation[0][channel] = torch.zeros_like(ablation[0][channel])
     encoder.ablation['output_layer'] = ablation.to(device).type(torch.cuda.FloatTensor)
 
     dissection.ablate_layers(encoder, [('resnet.7.2', 'output_layer')], adding=True)
-    replacement = torch.zeros(2048)
+    replacement = torch.zeros(1,2048,8,8)
     for channel in top_n_channels:
-        replacement[channel] = avg_tgt_word_output[channel].item()
+        #print(avg_tgt_word_output[channel]/10)
+        #SCALING FACTOR
+        scaling_factor = .1
+
+        replacement[0][channel] = torch.tensor(avg_tgt_word_output[channel]/scaling_factor)
+
     encoder.ablation['output_layer'] = replacement.to(device).type(torch.cuda.FloatTensor)
 
     # dissection.replace_layers(encoder, [('resnet.7.2', 'output_layer')])
     # rep = torch.tensor(avg_tgt_word_output)
     # encoder.replacement['output_layer'] = rep.to(device).type(torch.cuda.FloatTensor)
-    for i in range(num_imgs_to_test):
+
+    print("encoder updated!")
+    for i in range(final_num_images_to_test):
         current_img = images_not_containing_target[i]
         if viz:
-            seq, alphas = caption_image_beam_search(encoder, decoder, current_img, word_map, args.beam_size)
+            seq, alphas, awes = caption_image_beam_search_awes(encoder, decoder, current_img, word_map, args.beam_size)
+            #print(alphas)
+
             alphas = torch.FloatTensor(alphas)
+            #print(alphas.shape)
             print("==ORIGINAL==")
-            print(original_and_modified[i])
+            print(original_and_modified[i][0])
             visualize_att(current_img, seq, alphas, rev_word_map, args.smooth)
         word_mat = gather_word_data(encoder, decoder, current_img, word_map, args.beam_size)
         original_and_modified[i].append(word_mat[0])
+        o_set = set(original_and_modified[i][0])
+        m_set = set(original_and_modified[i][1]).difference(set([target_word]))
+        score = len(o_set.intersection(m_set))/len(o_set.union(m_set))
+        original_and_modified[i].append(score)
+        #print(score)
     # for img in original_and_modified:
     #     print(img[0])
     #     print(img[1])
     #     print("==")
     # for x in original_and_modified: print(x[1])
-    num_inserted = sum([1 for x in original_and_modified if target_word in x[1]])
+    all_scores = [x[2] for x in original_and_modified if target_word in x[1]]
+    avg_change = np.mean(all_scores)
+    num_inserted = len(all_scores)
     print("target word: ", target_word, "num channels: ", num_channels)
-    print("num inserted: ", num_inserted, "num_tested: ", num_imgs_to_test, "ratio: ", num_inserted / num_imgs_to_test)
+    print("num inserted: ", num_inserted, "num_tested: ", num_imgs_to_test, "ratio: ", num_inserted / num_imgs_to_test, "avg word change: ",avg_change)
 
 
 if __name__ == '__main__':
@@ -449,21 +681,39 @@ if __name__ == '__main__':
         visualize_att(args.img, seq, alphas, rev_word_map, args.smooth)
 
 
-    method = "save_channels_per_word"
-
+    method = "insert_topic"
     print("Executing method!")
 
     if method == "insert_topic":
-        insert_topic_into_caption(encoder,decoder,"man",word_to_tensor_pkl="word_to_tensors_4000.p",num_imgs_to_test=50,viz=False)
+        #man, 10 images
+        insert_topic_into_caption(encoder,decoder,"dog",word_to_tensor_pkl="word_to_tensors_1000_nonnormalized.p",num_imgs_to_test=100,viz=False,randomize=True)
 
     elif method == "search_for_channel_topics":
         search_for_channel_topics(pkl_location="word_to_tensors_all.p")
 
     elif method=="save_channels_per_word":
-        save_channels_per_word(encoder,decoder,img_list,num_images = 30,pkl_location="word_to_tensors_all.p")
+        save_channels_per_word(encoder,decoder,img_list[:1000],num_images = 1000,scale_by_attention=True,pkl_location="word_to_tensors_1000_nonnormalized.p")
 
     elif method=="ablate_one_channel":
         ablate_one_channel(encoder,decoder,one_img,channel_num=23)
 
     elif method == "observe_single_channel":
         observe_single_channel(encoder,decoder,channel_num=1000)
+    elif method == "test":
+        d1 = os.path.dirname(os.path.abspath(__file__)) + "/word_to_tensors_dicts/" + "word_to_tensors_default.p"
+        d2 = os.path.dirname(os.path.abspath(__file__)) + "/word_to_tensors_dicts/" + "word_to_tensors_1000.p"
+        m1 = pickle.load(open(d1, "rb"))
+        m2 = pickle.load(open(d2, "rb"))
+        s1 = m1["<start>"]
+        s2 = m2["<start>"]
+
+        x1 = []
+        x2 = []
+        for i in range(10):
+            x1.append(np.array(s1[1][i]))
+            x2.append(np.array(s2[1][i]))
+
+        x1 = np.array(x1)
+        x2 = np.array(x2)
+        n1 = np.array(s1[1][0])
+        n2 = np.array(s2[1][0])
