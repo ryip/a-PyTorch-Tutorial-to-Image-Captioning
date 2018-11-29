@@ -158,7 +158,7 @@ def caption_image_beam_search(encoder, decoder, image_path, word_map, beam_size=
 
     return seq, alphas
 
-def caption_image_beam_search_awes(encoder, decoder, image_path, word_map, beam_size=3):
+def caption_image_beam_search_awes(encoder, decoder, image_path, word_map, beam_size=3,all_captions = False):
     """
     Reads an image and captions it with beam search.
 
@@ -298,6 +298,11 @@ def caption_image_beam_search_awes(encoder, decoder, image_path, word_map, beam_
 
     i = complete_seqs_scores.index(max(complete_seqs_scores))
     seq = complete_seqs[i]
+    # print("scores:",complete_seqs_scores)
+    # print(sorted(range(len(complete_seqs_scores)),key = lambda x: complete_seqs_scores[x]))
+    # print(complete_seqs)
+    # print(seq)
+    # input("Press Enter to continue...")
     alphas = complete_seqs_alpha[i]
     awes = complete_seqs_awe[i]
     normalize = False
@@ -305,6 +310,10 @@ def caption_image_beam_search_awes(encoder, decoder, image_path, word_map, beam_
         normalized_awes = [[x*len(awe) / sum(awe) for x in awe] for awe in awes]
     else:
         normalized_awes = awes
+    if all_captions:
+        top_captions = sorted(range(len(complete_seqs_scores)),key = lambda x: complete_seqs_scores[x],reverse=True)
+        sorted_seqs = [complete_seqs[ind] for ind in top_captions]
+        return seq, alphas, normalized_awes, sorted_seqs
     return seq, alphas, normalized_awes
 
 def visualize_att(image_path, seq, alphas, rev_word_map, smooth=True):
@@ -367,17 +376,24 @@ def observe_single_channel(encoder,decoder,channel_num):
             print(st)
 
 
-def gather_word_data(encoder, decoder, img_list, word_map, beam_size,include_awes=False):
+def gather_word_data(encoder, decoder, img_list, word_map, beam_size,include_awes=False,all_captions = False):
     if not isinstance(img_list,list):
         img_list = [img_list]
     sentences = []
     rev_word_map = {v: k for k, v in word_map.items()}
     for img in img_list:
         try:
-            seq, alphas, awes = caption_image_beam_search_awes(encoder, decoder, img, word_map, beam_size)
+            if all_captions:
+                seq, alphas, awes, all_seqs = caption_image_beam_search_awes(encoder, decoder, img, word_map, beam_size,True)
+                for s in all_seqs:
+                    sentences.append([rev_word_map[i] for i in s])
+                #print(sentences)
+            else:
+                seq, alphas, awes = caption_image_beam_search_awes(encoder, decoder, img, word_map, beam_size)
+                sentences.append([rev_word_map[i] for i in seq])
         # alphas = torch.FloatTensor(alphas)
         # Visualize caption and attention of best sequence
-            sentences.append([rev_word_map[i] for i in seq])
+
         except ValueError:
             print("no caption")
             sentences.append([])
@@ -515,6 +531,100 @@ def search_for_channel_topics(pkl_location = "word_to_tensors_default.p"):
     plt.plot([s[i] - q[i] for i in range(len(s))])
     plt.show()
 
+def plot_word_activations(concept_to_word_list,word_to_tensor_pkl="word_to_tensors_default.p"):
+    pkled_directory = os.path.dirname(os.path.abspath(__file__)) + "/word_to_tensors_dicts/" + word_to_tensor_pkl
+    nd = pickle.load(open(pkled_directory, "rb"))
+
+    sorted_word_frequencies = sorted(nd.keys(), key=lambda x: len(nd[x][0]), reverse=True)
+    # Print out top 10 words.
+    print("Words and their frequencies:")
+    print("============")
+    for i in range(50): print(sorted_word_frequencies[i], len(nd[sorted_word_frequencies[i]][0]))
+
+
+    avg_all = nd["<start>"][1]
+    avg_all_output = np.mean([np.array(c) for c in avg_all], axis=0)
+
+    concept_to_avgs = {}
+
+    plt.figure(1)
+    plt.xlabel("Channel (sorted by decreasing relative intensity)")
+    plt.ylabel("Relative intensity")
+    plt.title("Intensity of channels for target word relative to baseline")
+    plt.figure(2)
+    plt.xlabel("Channel (sorted by decreasing relative intensity)")
+    plt.ylabel("Relative intensity")
+    plt.title("Most Active Channels")
+    plt.figure(3)
+    plt.xlabel("Channel (sorted by decreasing relative intensity)")
+    plt.ylabel("Relative intensity")
+    plt.title("Least Active Channels")
+
+    for concept,word_list in concept_to_word_list.items():
+        print("word list: ",word_list)
+        avg_tgt_word_outputs = []
+        for target_word in word_list:
+            print("%s has %d examples in dataset"%(target_word,len(nd[target_word][0])))
+            if target_word not in nd: continue
+
+            avg_channels = nd[target_word][1]
+            avg_awe_word = nd[target_word][2]
+
+            for i in range(len(avg_channels)):
+                avg_channels[i] = np.multiply(np.array(avg_channels[i]).transpose(), avg_awe_word[i]).transpose()
+            avg_tgt_word_outputs.append(np.mean([np.array(c) for c in avg_channels], axis=0))
+
+        #Weighted average of the responses of the words in the wordlist
+        avg_tgt_word_output_final = np.average(avg_tgt_word_outputs,weights=[len(nd[x][0]) for x in word_list],axis=0)
+        concept_to_avgs[concept] = avg_tgt_word_output_final
+
+        channels_by_significance = sorted(range(len(avg_all_output)),
+                                          key=lambda x: np.sum(avg_tgt_word_output_final[x] - avg_all_output[x]), reverse=True)
+
+        #Length of most and least active channel windows to look at
+        hlength = 10
+        tlength = 30
+
+        plt.figure(1)
+        plt.plot([np.sum(avg_tgt_word_output_final[x] - avg_all_output[x]) for x in channels_by_significance],label = concept)
+        plt.legend()
+
+        plt.figure(2)
+        most_activated = [np.sum(avg_tgt_word_output_final[x] - avg_all_output[x]) for x in channels_by_significance][:hlength]
+        plt.plot(most_activated,label = concept)
+        print("most active channels: ",channels_by_significance[:10])
+        for i in range(5):
+            plt.annotate(channels_by_significance[i],xy = (i,most_activated[i]),xytext=(i,most_activated[i]))
+        plt.legend()
+
+        plt.figure(3)
+        least_activated = [np.sum(avg_tgt_word_output_final[x] - avg_all_output[x]) for x in channels_by_significance][-tlength:]
+        plt.plot(least_activated,label = concept)
+        print("least active channels: ", channels_by_significance[-10:])
+        for j in range(10):
+            i = j+1
+            #plt.annotate(channels_by_significance[-i], xy=(tlength-i, least_activated[-i]), xytext=(tlength-i, least_activated[-i]))
+        plt.legend()
+
+    plt.show()
+        # plt.plot([np.sum(avg_tgt_word_output_final[x] - avg_all_output[x]) for x in channels_by_significance])
+        # plt.xlabel("Channel (sorted by decreasing relative intensity)")
+        # plt.ylabel("Relative intensity")
+        # plt.title("Intensity of channels (weighted by attention) for target word relative to baseline")
+        # plt.show()
+        #
+        # plt.plot([np.sum(avg_tgt_word_output_final[x] - avg_all_output[x]) for x in channels_by_significance][:100])
+        # plt.xlabel("Channel (sorted by decreasing relative intensity)")
+        # plt.ylabel("Relative intensity")
+        # plt.title("Front End")
+        # plt.show()
+        #
+        # plt.plot([np.sum(avg_tgt_word_output_final[x] - avg_all_output[x]) for x in channels_by_significance][-100:])
+        # plt.xlabel("Channel (sorted by decreasing relative intensity)")
+        # plt.ylabel("Relative intensity")
+        # plt.title("Tail End")
+        # plt.show()
+
 def insert_topic_into_caption(encoder,decoder,target_word,word_to_tensor_pkl="word_to_tensors_default.p",num_imgs_to_test=None,viz=False,randomize=False):
     pkled_directory = os.path.dirname(os.path.abspath(__file__)) + "/word_to_tensors_dicts/" + word_to_tensor_pkl
     nd = pickle.load(open(pkled_directory, "rb"))
@@ -523,6 +633,8 @@ def insert_topic_into_caption(encoder,decoder,target_word,word_to_tensor_pkl="wo
     # Print out top 10 words.
     for i in range(30): print(sorted_word_frequencies[i], len(nd[sorted_word_frequencies[i]][0]))
 
+    print("========")
+    print("target word ~ %s ~ appears %d times" % (target_word,len(nd[target_word][0])))
 
     # avg_channels = np.multiply(np.array(encoder_output).transpose(), word_awe).transpose()
     avg_channels = nd[target_word][1]
@@ -534,16 +646,13 @@ def insert_topic_into_caption(encoder,decoder,target_word,word_to_tensor_pkl="wo
 
     #print("time: ",toc)
 
-    #print(avg_channels[0],len(avg_channels))
-    #avgs = avg_channels[0].mean(dim=1).mean(dim=1)
-    #print(avgs.size())
+
     avg_all = nd["<start>"][1]
 
     images_not_containing_target = [im for im in nd["<start>"][0] if im not in nd[target_word][0]]
     if randomize:
         shuffle(images_not_containing_target)
 
-    # print(images_not_containing_target[0])
     avg_tgt_word_output = np.mean([np.array(c) for c in avg_channels], axis=0)
     avg_all_output = np.mean([np.array(c) for c in avg_all], axis=0)
     #print(np.linalg.norm(avg_tgt_word_output[0] - avg_all_output[0]))
@@ -551,18 +660,28 @@ def insert_topic_into_caption(encoder,decoder,target_word,word_to_tensor_pkl="wo
     # Number of channels to change. Set to 0 to generate original image
     # ======================
 
-    num_channels = 40
+    num_channels = 1
 
     #channels_by_significance = sorted(range(len(avg_all_output)), key=lambda x: np.linalg.norm(avg_tgt_word_output[x] - avg_all_output[x],1), reverse=True)
     channels_by_significance = sorted(range(len(avg_all_output)), key=lambda x: np.sum(avg_tgt_word_output[x] - avg_all_output[x]), reverse=True)
     top_n_channels = channels_by_significance[:num_channels] + channels_by_significance[-num_channels:]
 
-    plt.plot([np.sum(avg_tgt_word_output[x] - avg_all_output[x]) for x in channels_by_significance][:100])
-    plt.xlabel("Channel (sorted by decreasing relative intensity)")
-    plt.ylabel("Relative intensity")
-    plt.title("Intensity of channels (weighted by attention) for target word relative to baseline")
-    plt.show()
-    # plt.plot([np.sum(avg_tgt_word_output[x] - avg_all_output[x]) for x in channels_by_significance][-200:])
+    # plt.plot([np.sum(avg_tgt_word_output[x] - avg_all_output[x]) for x in channels_by_significance])
+    # plt.xlabel("Channel (sorted by decreasing relative intensity)")
+    # plt.ylabel("Relative intensity")
+    # plt.title("Intensity of channels for target word relative to baseline")
+    # plt.show()
+    #
+    # plt.plot([np.sum(avg_tgt_word_output[x] - avg_all_output[x]) for x in channels_by_significance][:100])
+    # plt.xlabel("Channel (sorted by decreasing relative intensity)")
+    # plt.ylabel("Relative intensity")
+    # plt.title("Front End")
+    # plt.show()
+    #
+    # plt.plot([np.sum(avg_tgt_word_output[x] - avg_all_output[x]) for x in channels_by_significance][-100:])
+    # plt.xlabel("Channel (sorted by decreasing relative intensity)")
+    # plt.ylabel("Relative intensity")
+    # plt.title("Tail End")
     # plt.show()
 
     # print(top_n_channels)
@@ -574,8 +693,8 @@ def insert_topic_into_caption(encoder,decoder,target_word,word_to_tensor_pkl="wo
     final_num_images_to_test = min(num_imgs_to_test,len(images_not_containing_target))
     for i in range(final_num_images_to_test):
         current_img = images_not_containing_target[i]
-        word_mat = gather_word_data(encoder, decoder, current_img, word_map, args.beam_size)
-        original_and_modified.append(word_mat)
+        word_mat = gather_word_data(encoder, decoder, current_img, word_map, args.beam_size,all_captions=True)
+        original_and_modified.append([word_mat])
 
 
     # NETDISSECT STARTS HERE
@@ -590,7 +709,7 @@ def insert_topic_into_caption(encoder,decoder,target_word,word_to_tensor_pkl="wo
     for channel in top_n_channels:
         #print(avg_tgt_word_output[channel]/10)
         #SCALING FACTOR
-        scaling_factor = .1
+        scaling_factor = .03
 
         replacement[0][channel] = torch.tensor(avg_tgt_word_output[channel]/scaling_factor)
 
@@ -610,25 +729,25 @@ def insert_topic_into_caption(encoder,decoder,target_word,word_to_tensor_pkl="wo
             alphas = torch.FloatTensor(alphas)
             #print(alphas.shape)
             print("==ORIGINAL==")
-            print(original_and_modified[i][0])
+            print(original_and_modified[i][0][0])
             visualize_att(current_img, seq, alphas, rev_word_map, args.smooth)
         word_mat = gather_word_data(encoder, decoder, current_img, word_map, args.beam_size)
         original_and_modified[i].append(word_mat[0])
-        o_set = set(original_and_modified[i][0])
+        o_set = set()
+        for capt in original_and_modified[i][0]:
+            o_set.update([wd for wd in capt])
+
+
         m_set = set(original_and_modified[i][1]).difference(set([target_word]))
-        score = len(o_set.intersection(m_set))/len(o_set.union(m_set))
+        score = len(o_set.intersection(m_set))/len(m_set)
         original_and_modified[i].append(score)
         #print(score)
-    # for img in original_and_modified:
-    #     print(img[0])
-    #     print(img[1])
-    #     print("==")
-    # for x in original_and_modified: print(x[1])
+
     all_scores = [x[2] for x in original_and_modified if target_word in x[1]]
     avg_change = np.mean(all_scores)
     num_inserted = len(all_scores)
     print("target word: ", target_word, "num channels: ", num_channels)
-    print("num inserted: ", num_inserted, "num_tested: ", num_imgs_to_test, "ratio: ", num_inserted / num_imgs_to_test, "avg word change: ",avg_change)
+    print("num inserted: ", num_inserted, "num_tested: ", num_imgs_to_test, "ratio: ", num_inserted / num_imgs_to_test, "avg word consistency: ",avg_change)
 
 
 if __name__ == '__main__':
@@ -639,6 +758,7 @@ if __name__ == '__main__':
     parser.add_argument('--word_map', '-wm', help='path to word map JSON')
     parser.add_argument('--beam_size', '-b', default=5, type=int, help='beam size for beam search')
     parser.add_argument('--dont_smooth', dest='smooth', action='store_false', help='do not smooth alpha overlay')
+    parser.add_argument('--method', '-md', default=None, help='method to run')
 
     args = parser.parse_args()
 
@@ -681,18 +801,55 @@ if __name__ == '__main__':
         visualize_att(args.img, seq, alphas, rev_word_map, args.smooth)
 
 
-    method = "insert_topic"
-    print("Executing method!")
+    method = "plot_word_activations"
 
-    if method == "insert_topic":
-        #man, 10 images
-        insert_topic_into_caption(encoder,decoder,"dog",word_to_tensor_pkl="word_to_tensors_1000_nonnormalized.p",num_imgs_to_test=100,viz=False,randomize=True)
+    if args.method is not None: method = args.method
 
+    print("Executing method: ",method)
+
+    if method == "other":
+        pkl_dir = os.path.dirname(os.path.abspath(__file__)) + "/word_to_tensors_dicts/"
+        d1 = pickle.load(open(pkl_dir + "word_to_tensors_1000_nonnormalized.p", "rb"))
+        d2 = pickle.load(open(pkl_dir + "word_to_tensors_1000_nonnormalized_pt2.p", "rb"))
+        all_words = set(list(d1.keys()) + list(d2.keys()))
+        print(len(d1.keys()),len(d2.keys()))
+        print(len(all_words),"# of words")
+        master_dict = {}
+        for word in all_words:
+            master_dict[word] = [[],[],[]]
+            if word in d1:
+                d1w = d1[word]
+                master_dict[word][0]+=d1w[0]
+                master_dict[word][1]+=d1w[1]
+                master_dict[word][2] += d1w[2]
+            if word in d2:
+                d2w = d2[word]
+                master_dict[word][0]+=d2w[0]
+                master_dict[word][1]+=d2w[1]
+                master_dict[word][2] += d2w[2]
+
+        pkled_directory = os.path.dirname(os.path.abspath(__file__)) + "/word_to_tensors_dicts/" + "word_to_tensors_2000_nonnormalized.p"
+        print("pickling to: ", pkled_directory)
+
+        pickle.dump(master_dict, open(pkled_directory, "wb"))
+
+
+    elif method == "insert_topic":
+        insert_topic_into_caption(encoder,decoder,"in",word_to_tensor_pkl="word_to_tensors_2000_nonnormalized.p",num_imgs_to_test=10,viz=True,randomize=True)
+
+    elif method == "plot_word_activations":
+        colors = ["black","white","brown","red"]
+        humans = ["man","woman","boy","girl"]
+        prepositions = ["on","of","to","with"]
+        just_in = ["in"]
+        concept_dict = {"other prepositions":prepositions,"in":just_in}
+
+        plot_word_activations(concept_dict,word_to_tensor_pkl="word_to_tensors_2000_nonnormalized.p")
     elif method == "search_for_channel_topics":
         search_for_channel_topics(pkl_location="word_to_tensors_all.p")
 
     elif method=="save_channels_per_word":
-        save_channels_per_word(encoder,decoder,img_list[:1000],num_images = 1000,scale_by_attention=True,pkl_location="word_to_tensors_1000_nonnormalized.p")
+        save_channels_per_word(encoder,decoder,img_list[1000:2000],num_images = 2000,scale_by_attention=True,pkl_location="word_to_tensors_1000_nonnormalized_pt2.p")
 
     elif method=="ablate_one_channel":
         ablate_one_channel(encoder,decoder,one_img,channel_num=23)
