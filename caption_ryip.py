@@ -544,19 +544,22 @@ def plot_word_activations(concept_to_word_list,word_to_tensor_pkl="word_to_tenso
 
     avg_all = nd["<start>"][1]
     avg_all_output = np.mean([np.array(c) for c in avg_all], axis=0)
+    avg_per_channel = np.mean([np.array(c) for c in avg_all], axis=(2,3))
+    avg_stdev = np.std(avg_per_channel,axis=0)
+    print(avg_stdev[:10])
 
     concept_to_avgs = {}
 
     plt.figure(1)
-    plt.xlabel("Channel (sorted by decreasing relative intensity)")
+    plt.xlabel("Rank of Channel Intensity")
     plt.ylabel("Relative intensity")
     plt.title("Intensity of channels for target word relative to baseline")
     plt.figure(2)
-    plt.xlabel("Channel (sorted by decreasing relative intensity)")
+    plt.xlabel("Rank of Channel Intensity")
     plt.ylabel("Relative intensity")
     plt.title("Most Active Channels")
     plt.figure(3)
-    plt.xlabel("Channel (sorted by decreasing relative intensity)")
+    plt.xlabel("Rank of Channel Intensity")
     plt.ylabel("Relative intensity")
     plt.title("Least Active Channels")
 
@@ -574,31 +577,36 @@ def plot_word_activations(concept_to_word_list,word_to_tensor_pkl="word_to_tenso
                 avg_channels[i] = np.multiply(np.array(avg_channels[i]).transpose(), avg_awe_word[i]).transpose()
             avg_tgt_word_outputs.append(np.mean([np.array(c) for c in avg_channels], axis=0))
 
+
         #Weighted average of the responses of the words in the wordlist
         avg_tgt_word_output_final = np.average(avg_tgt_word_outputs,weights=[len(nd[x][0]) for x in word_list],axis=0)
         concept_to_avgs[concept] = avg_tgt_word_output_final
 
+        def channel_significance_function(x):
+            return np.sum(avg_tgt_word_output_final[x] - avg_all_output[x]) / avg_stdev[x]
+
         channels_by_significance = sorted(range(len(avg_all_output)),
-                                          key=lambda x: np.sum(avg_tgt_word_output_final[x] - avg_all_output[x]), reverse=True)
+                                          key=channel_significance_function, reverse=True)
 
         #Length of most and least active channel windows to look at
         hlength = 10
         tlength = 30
 
         plt.figure(1)
-        plt.plot([np.sum(avg_tgt_word_output_final[x] - avg_all_output[x]) for x in channels_by_significance],label = concept)
+        plt.plot([channel_significance_function(x) for x in channels_by_significance],label = concept)
         plt.legend()
 
         plt.figure(2)
-        most_activated = [np.sum(avg_tgt_word_output_final[x] - avg_all_output[x]) for x in channels_by_significance][:hlength]
+        most_activated = [channel_significance_function(x) for x in channels_by_significance][:hlength]
         plt.plot(most_activated,label = concept)
         print("most active channels: ",channels_by_significance[:10])
+        print("Avg of top %s significant channels: %f"%(3,sum(most_activated[:3])/3.))
         for i in range(5):
             plt.annotate(channels_by_significance[i],xy = (i,most_activated[i]),xytext=(i,most_activated[i]))
         plt.legend()
 
         plt.figure(3)
-        least_activated = [np.sum(avg_tgt_word_output_final[x] - avg_all_output[x]) for x in channels_by_significance][-tlength:]
+        least_activated = [channel_significance_function(x) for x in channels_by_significance][-tlength:]
         plt.plot(least_activated,label = concept)
         print("least active channels: ", channels_by_significance[-10:])
         for j in range(10):
@@ -649,7 +657,11 @@ def insert_topic_into_caption(encoder,decoder,target_word,word_to_tensor_pkl="wo
 
     avg_all = nd["<start>"][1]
 
+
     images_not_containing_target = [im for im in nd["<start>"][0] if im not in nd[target_word][0]]
+    #####images_not_containing_target = nd[target_word][0]
+
+
     if randomize:
         shuffle(images_not_containing_target)
 
@@ -660,7 +672,7 @@ def insert_topic_into_caption(encoder,decoder,target_word,word_to_tensor_pkl="wo
     # Number of channels to change. Set to 0 to generate original image
     # ======================
 
-    num_channels = 1
+    num_channels = 10
 
     #channels_by_significance = sorted(range(len(avg_all_output)), key=lambda x: np.linalg.norm(avg_tgt_word_output[x] - avg_all_output[x],1), reverse=True)
     channels_by_significance = sorted(range(len(avg_all_output)), key=lambda x: np.sum(avg_tgt_word_output[x] - avg_all_output[x]), reverse=True)
@@ -700,6 +712,9 @@ def insert_topic_into_caption(encoder,decoder,target_word,word_to_tensor_pkl="wo
     # NETDISSECT STARTS HERE
     dissection.ablate_layers(encoder, [('resnet.7.2', 'output_layer')])
     ablation = torch.ones(1,2048,8,8)
+
+    ##ONLY FOR BLOCKING OUT "IN"
+
     for channel in top_n_channels:
         ablation[0][channel] = torch.zeros_like(ablation[0][channel])
     encoder.ablation['output_layer'] = ablation.to(device).type(torch.cuda.FloatTensor)
@@ -707,17 +722,13 @@ def insert_topic_into_caption(encoder,decoder,target_word,word_to_tensor_pkl="wo
     dissection.ablate_layers(encoder, [('resnet.7.2', 'output_layer')], adding=True)
     replacement = torch.zeros(1,2048,8,8)
     for channel in top_n_channels:
-        #print(avg_tgt_word_output[channel]/10)
+
         #SCALING FACTOR
-        scaling_factor = .03
+        scaling_factor = .2
 
         replacement[0][channel] = torch.tensor(avg_tgt_word_output[channel]/scaling_factor)
 
     encoder.ablation['output_layer'] = replacement.to(device).type(torch.cuda.FloatTensor)
-
-    # dissection.replace_layers(encoder, [('resnet.7.2', 'output_layer')])
-    # rep = torch.tensor(avg_tgt_word_output)
-    # encoder.replacement['output_layer'] = rep.to(device).type(torch.cuda.FloatTensor)
 
     print("encoder updated!")
     for i in range(final_num_images_to_test):
@@ -808,42 +819,51 @@ if __name__ == '__main__':
     print("Executing method: ",method)
 
     if method == "other":
-        pkl_dir = os.path.dirname(os.path.abspath(__file__)) + "/word_to_tensors_dicts/"
-        d1 = pickle.load(open(pkl_dir + "word_to_tensors_1000_nonnormalized.p", "rb"))
-        d2 = pickle.load(open(pkl_dir + "word_to_tensors_1000_nonnormalized_pt2.p", "rb"))
-        all_words = set(list(d1.keys()) + list(d2.keys()))
-        print(len(d1.keys()),len(d2.keys()))
-        print(len(all_words),"# of words")
-        master_dict = {}
-        for word in all_words:
-            master_dict[word] = [[],[],[]]
-            if word in d1:
-                d1w = d1[word]
-                master_dict[word][0]+=d1w[0]
-                master_dict[word][1]+=d1w[1]
-                master_dict[word][2] += d1w[2]
-            if word in d2:
-                d2w = d2[word]
-                master_dict[word][0]+=d2w[0]
-                master_dict[word][1]+=d2w[1]
-                master_dict[word][2] += d2w[2]
-
-        pkled_directory = os.path.dirname(os.path.abspath(__file__)) + "/word_to_tensors_dicts/" + "word_to_tensors_2000_nonnormalized.p"
-        print("pickling to: ", pkled_directory)
-
-        pickle.dump(master_dict, open(pkled_directory, "wb"))
+        pass
+        # pkl_dir = os.path.dirname(os.path.abspath(__file__)) + "/word_to_tensors_dicts/"
+        # d1 = pickle.load(open(pkl_dir + "word_to_tensors_1000_nonnormalized.p", "rb"))
+        # d2 = pickle.load(open(pkl_dir + "word_to_tensors_1000_nonnormalized_pt2.p", "rb"))
+        # all_words = set(list(d1.keys()) + list(d2.keys()))
+        # print(len(d1.keys()),len(d2.keys()))
+        # print(len(all_words),"# of words")
+        # master_dict = {}
+        # for word in all_words:
+        #     master_dict[word] = [[],[],[]]
+        #     if word in d1:
+        #         d1w = d1[word]
+        #         master_dict[word][0]+=d1w[0]
+        #         master_dict[word][1]+=d1w[1]
+        #         master_dict[word][2] += d1w[2]
+        #     if word in d2:
+        #         d2w = d2[word]
+        #         master_dict[word][0]+=d2w[0]
+        #         master_dict[word][1]+=d2w[1]
+        #         master_dict[word][2] += d2w[2]
+        #
+        # pkled_directory = os.path.dirname(os.path.abspath(__file__)) + "/word_to_tensors_dicts/" + "word_to_tensors_2000_nonnormalized.p"
+        # print("pickling to: ", pkled_directory)
+        #
+        # pickle.dump(master_dict, open(pkled_directory, "wb"))
 
 
     elif method == "insert_topic":
-        insert_topic_into_caption(encoder,decoder,"in",word_to_tensor_pkl="word_to_tensors_2000_nonnormalized.p",num_imgs_to_test=10,viz=True,randomize=True)
+        insert_topic_into_caption(encoder,decoder,"black",word_to_tensor_pkl="word_to_tensors_2000_nonnormalized.p",num_imgs_to_test=10,viz=True,randomize=True)
 
     elif method == "plot_word_activations":
+        nouns = ["man","dog","woman","couple","frisbee"]
+        verbs = ["standing","sitting","holding","riding","playing"]
+
         colors = ["black","white","brown","red"]
         humans = ["man","woman","boy","girl"]
+        areas = ["water","snow","field","grass"]
         prepositions = ["on","of","to","with"]
         just_in = ["in"]
-        concept_dict = {"other prepositions":prepositions,"in":just_in}
-
+        #concept_dict = {"nouns":nouns,"verbs":verbs,"prepositions":prepositions}
+        concept_dict = {"next":["next"],"in":["in"],"over":["over"],"under":["under"]}
+        #concept_dict = {"man":["man"],"woman":["woman"],"dog":["dog"],"standing":["standing"],
+        #                "sitting":["sitting"],"playing":["playing"],"in":["in"],"is":["is"],"with":["with"]}
+        #concept_dict = {"standing": ["standing"],"sitting":["sitting"],"playing":["playing"],"riding":["riding"]}
+        #concept_dict = {"colors":colors,"humans":humans,"areas":areas}
         plot_word_activations(concept_dict,word_to_tensor_pkl="word_to_tensors_2000_nonnormalized.p")
     elif method == "search_for_channel_topics":
         search_for_channel_topics(pkl_location="word_to_tensors_all.p")
